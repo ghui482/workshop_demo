@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stock Close Explorer</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #172338; background: #f3f6fa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 1000px; margin: 0 auto; padding: 48px 20px 64px; }
+    h1 { font-size: clamp(1.8rem, 5vw, 2.5rem); margin: 0 0 8px; }
+    h2 { font-size: 1.15rem; margin: 0 0 8px; }
+    p { line-height: 1.5; }
+    .intro, .hint { color: #5b687b; }
+    .card { background: white; border: 1px solid #e0e7ef; border-radius: 14px; padding: 24px; margin-top: 24px; box-shadow: 0 5px 24px #1c3a5b0a; }
+    label { display: block; font-weight: 650; margin-bottom: 10px; }
+    input[type=file] { width: 100%; font: inherit; color: #44546b; }
+    input[type=file]::file-selector-button { background: #175cd3; color: white; border: 0; border-radius: 7px; padding: 10px 15px; font: inherit; font-weight: 600; margin-right: 12px; cursor: pointer; }
+    .hint { font-size: .9rem; margin: 12px 0 0; }
+    .message { margin: 16px 0 0; color: #a02727; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 18px; }
+    .stat { background: #f5f8fc; border-radius: 9px; padding: 14px; }
+    .stat span { display: block; color: #5b687b; font-size: .85rem; margin-bottom: 5px; }
+    .stat strong { font-size: 1.08rem; overflow-wrap: anywhere; }
+    .chart-wrap { height: 340px; position: relative; margin-top: 22px; }
+    canvas { display: block; width: 100%; height: 100%; }
+    [hidden] { display: none !important; }
+    @media (max-width: 500px) { main { padding: 30px 14px; } .card { padding: 18px; } .chart-wrap { height: 270px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Stock Close Explorer</h1>
+    <p class="intro">Upload a CSV to explore closing prices over time. Your file stays in your browser.</p>
+    <section class="card" aria-labelledby="upload-title">
+      <h2 id="upload-title">Choose your data</h2>
+      <p class="hint">Select a CSV with a header row containing <strong>Date</strong> and <strong>Close</strong>.</p>
+      <br>
+      <label for="file">CSV file</label>
+      <input id="file" type="file" accept=".csv,text/csv">
+      <p id="message" class="message" role="alert" hidden></p>
+    </section>
+    <section id="results" class="card" hidden aria-labelledby="results-title">
+      <h2 id="results-title">Closing price overview</h2>
+      <p id="filename" class="hint"></p>
+      <div class="stats">
+        <div class="stat"><span>Valid rows</span><strong id="count"></strong></div>
+        <div class="stat"><span>Date range</span><strong id="range"></strong></div>
+        <div class="stat"><span>Mean close</span><strong id="mean"></strong></div>
+        <div class="stat"><span>Minimum close</span><strong id="min"></strong></div>
+        <div class="stat"><span>Maximum close</span><strong id="max"></strong></div>
+      </div>
+      <p id="skipped" class="hint" hidden></p>
+      <div class="chart-wrap"><canvas id="chart" role="img" aria-label="Line chart of closing price over time"></canvas></div>
+      <p class="hint">Dates are shown on the horizontal axis; closing prices are shown on the vertical axis.</p>
+    </section>
+  </main>
+  <script>
+    const fileInput = document.getElementById('file');
+    const message = document.getElementById('message');
+    const results = document.getElementById('results');
+    const canvas = document.getElementById('chart');
+    let chartData = [];
+    let selectionId = 0;
+
+    // Handles quoted commas, escaped quotes, and line breaks inside quoted fields.
+    function parseCSV(text) {
+      text = text.replace(/^\uFEFF/, '');
+      const rows = [];
+      let row = [], field = '', quoted = false, afterQuote = false;
+      for (let i = 0; i < text.length; i++) {
+        const char = text[i];
+        if (quoted) {
+          if (char === '"' && text[i + 1] === '"') { field += '"'; i++; }
+          else if (char === '"') { quoted = false; afterQuote = true; }
+          else field += char;
+        } else if (afterQuote && char !== ',' && char !== '\n' && char !== '\r') {
+          throw new Error('Invalid CSV: unexpected character after a quoted field.');
+        } else if (char === '"') {
+          if (field !== '') throw new Error('Invalid CSV: unexpected quote in a field.');
+          quoted = true;
+        } else if (char === ',') {
+          row.push(field); field = ''; afterQuote = false;
+        } else if (char === '\n' || char === '\r') {
+          row.push(field); rows.push(row); row = []; field = ''; afterQuote = false;
+          if (char === '\r' && text[i + 1] === '\n') i++;
+        } else field += char;
+      }
+      if (quoted) throw new Error('Invalid CSV: a quoted field was not closed.');
+      if (field !== '' || row.length || afterQuote) { row.push(field); rows.push(row); }
+      return rows;
+    }
+
+    function readData(text) {
+      const rows = parseCSV(text);
+      if (!rows.length) throw new Error('The CSV file is empty. Please select a file with Date and Close columns.');
+      const headers = rows[0].map(value => value.trim().toLowerCase());
+      const dateIndex = headers.indexOf('date'), closeIndex = headers.indexOf('close');
+      const missing = [];
+      if (dateIndex === -1) missing.push('Date');
+      if (closeIndex === -1) missing.push('Close');
+      if (missing.length) throw new Error('Missing required column' + (missing.length > 1 ? 's: ' : ': ') + missing.join(' and ') + '. Check the first row of your CSV.');
+      const data = [];
+      let skipped = 0;
+      for (const row of rows.slice(1)) {
+        if (row.every(value => !value.trim())) continue;
+        const date = (row[dateIndex] || '').trim();
+        const close = (row[closeIndex] || '').trim();
+        const time = Date.parse(date);
+        const price = Number(close);
+        if (!date || !Number.isFinite(time) || !close || !Number.isFinite(price)) { skipped++; continue; }
+        data.push({ date, time, price });
+      }
+      if (!data.length) throw new Error('No valid data rows found. Dates must be recognizable and Close values must be numbers.');
+      data.sort((a, b) => a.time - b.time);
+      return { data, skipped };
+    }
+
+    function drawChart(data) {
+      const rect = canvas.getBoundingClientRect();
+      const width = rect.width, height = rect.height, ratio = window.devicePixelRatio || 1;
+      canvas.width = Math.round(width * ratio); canvas.height = Math.round(height * ratio);
+      const ctx = canvas.getContext('2d');
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      const pad = { left: 68, right: 18, top: 18, bottom: 42 };
+      const plotWidth = Math.max(1, width - pad.left - pad.right), plotHeight = Math.max(1, height - pad.top - pad.bottom);
+      let low = Infinity, high = -Infinity;
+      for (const point of data) { low = Math.min(low, point.price); high = Math.max(high, point.price); }
+      const margin = (high - low) * 0.08 || Math.max(Math.abs(high) * 0.05, 1);
+      low -= margin; high += margin;
+      const first = data[0].time, last = data[data.length - 1].time;
+      const x = time => pad.left + (last === first ? plotWidth / 2 : (time - first) / (last - first) * plotWidth);
+      const y = price => pad.top + (high - price) / (high - low) * plotHeight;
+      ctx.font = '12px system-ui, sans-serif'; ctx.textBaseline = 'middle';
+      for (let i = 0; i <= 4; i++) {
+        const value = low + (high - low) * i / 4, pos = y(value);
+        ctx.strokeStyle = '#e5ebf2'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(pad.left, pos); ctx.lineTo(width - pad.right, pos); ctx.stroke();
+        ctx.fillStyle = '#5b687b'; ctx.textAlign = 'right'; ctx.fillText(value.toFixed(2), pad.left - 8, pos);
+      }
+      ctx.fillStyle = '#5b687b'; ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+      ctx.fillText(data[0].date, pad.left, height - 26);
+      if (last !== first) { ctx.textAlign = 'right'; ctx.fillText(data[data.length - 1].date, width - pad.right, height - 26); }
+      ctx.strokeStyle = '#175cd3'; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.beginPath();
+      data.forEach((point, i) => i ? ctx.lineTo(x(point.time), y(point.price)) : ctx.moveTo(x(point.time), y(point.price)));
+      ctx.stroke();
+      if (data.length === 1) { ctx.fillStyle = '#175cd3'; ctx.beginPath(); ctx.arc(x(first), y(data[0].price), 3, 0, Math.PI * 2); ctx.fill(); }
+    }
+
+    fileInput.addEventListener('change', async () => {
+      const id = ++selectionId, file = fileInput.files[0];
+      results.hidden = true; message.hidden = true; chartData = [];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        if (id !== selectionId) return;
+        const { data, skipped } = readData(text);
+        chartData = data;
+        let sum = 0, min = Infinity, max = -Infinity;
+        for (const point of data) { sum += point.price; min = Math.min(min, point.price); max = Math.max(max, point.price); }
+        document.getElementById('filename').textContent = file.name;
+        document.getElementById('count').textContent = data.length.toLocaleString();
+        document.getElementById('range').textContent = data[0].date + ' to ' + data[data.length - 1].date;
+        document.getElementById('mean').textContent = (sum / data.length).toFixed(2);
+        document.getElementById('min').textContent = min.toFixed(2);
+        document.getElementById('max').textContent = max.toFixed(2);
+        const note = document.getElementById('skipped');
+        note.hidden = skipped === 0;
+        note.textContent = skipped + ' row(s) skipped because Date or Close was missing or invalid.';
+        results.hidden = false;
+        drawChart(data);
+      } catch (error) {
+        if (id !== selectionId) return;
+        results.hidden = true; chartData = [];
+        message.textContent = error.message || 'Could not read the file. Please try another CSV.';
+        message.hidden = false;
+      }
+    });
+    window.addEventListener('resize', () => { if (chartData.length && !results.hidden) drawChart(chartData); });
+  </script>
+</body>
+</html>
+
